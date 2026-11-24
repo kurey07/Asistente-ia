@@ -1,0 +1,457 @@
+#!/usr/bin/env python3
+"""
+CARTER · asistente personal privado para Discord (modo GitHub Actions).
+
+Modos de uso:
+  python carter.py sondeo    -> lee mensajes nuevos de tus canales y responde
+  python carter.py resumen   -> publica el resumen diario de pendientes
+
+Cada canal del servidor es un proyecto. La memoria de cada proyecto vive en
+memoria/<canal>.json y se guarda en el propio repositorio.
+"""
+import datetime as dt
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+import requests
+
+API = "https://discord.com/api/v10"
+RAIZ = Path(__file__).resolve().parent
+MEMORIA = RAIZ / "memoria"
+ESTADO = RAIZ / "estado.json"
+
+
+def entorno(nombre, defecto=""):
+    return os.environ.get(nombre, defecto).strip()
+
+
+# --- Configuración (todo viene de los "Secrets" del repositorio) ---
+TOKEN = entorno("DISCORD_TOKEN")
+GUILD_ID = entorno("DISCORD_GUILD_ID")
+USUARIO = entorno("DISCORD_USER_ID")          # solo este usuario puede usar el bot
+CANAL_RESUMEN = entorno("CANAL_RESUMEN", "general")
+ZONA = entorno("ZONA_HORARIA", "Atlantic/Canary")
+
+# IA opcional: si no se configura, el bot funciona solo con comandos.
+IA_PROVEEDOR = entorno("IA_PROVEEDOR").lower()  # anthropic | gemini | openai
+IA_MODELO = entorno("IA_MODELO")
+IA_CLAVE = entorno("IA_CLAVE")
+IA_URL = entorno("IA_URL")                      # solo para proveedores compatibles con OpenAI
+
+HEAD = {"Authorization": f"Bot {TOKEN}", "User-Agent": "CARTER (uso personal, 1.0)"}
+
+AYUDA = """**Comandos de CARTER** (el canal donde escribes es el proyecto)
+`!tarea texto | AAAA-MM-DD` · añade una tarea (la fecha es opcional)
+`!pendientes` · tareas sin terminar · `!tareas` · todas las tareas
+`!hecha N` · marca la tarea N como hecha
+`!semana` · plan de la semana: vencidas, próximos 7 días y sin fecha
+`!decision texto` · guarda una decisión · `!decisiones` para verlas
+`!nota texto` · guarda una nota · `!notas` para verlas
+`!estado texto` · actualiza el estado del proyecto (sin texto, lo muestra)
+`!descripcion texto` · descripción u objetivos del proyecto
+`!resumen` · resumen completo del proyecto
+`!proyectos` · lista de todos los proyectos
+`!borrar tarea|decision|nota N` · elimina un elemento
+`!borrarproyecto confirmar` · elimina toda la memoria de este proyecto
+Si hay una IA conectada, cualquier mensaje sin `!` se responde con ella usando la memoria del proyecto."""
+
+
+# ----------------------------- Utilidades -----------------------------
+
+def hoy_local():
+    return dt.datetime.now(ZoneInfo(ZONA)).date()
+
+
+def limpiar(nombre):
+    """Nombre de canal -> nombre de archivo seguro."""
+    return re.sub(r"[^\w-]", "", nombre.lower()) or "sin-nombre"
+
+
+def trocear(texto, limite=1900):
+    """Divide un texto largo en trozos que quepan en un mensaje de Discord."""
+    trozos, actual = [], ""
+    for linea in texto.split("\n"):
+        while len(linea) > limite:
+            if actual:
+                trozos.append(actual)
+                actual = ""
+            trozos.append(linea[:limite])
+            linea = linea[limite:]
+        if len(actual) + len(linea) + 1 > limite:
+            trozos.append(actual)
+            actual = linea
+        else:
+            actual = f"{actual}\n{linea}" if actual else linea
+    if actual:
+        trozos.append(actual)
+    return trozos or [""]
+
+
+# ----------------------------- Discord -----------------------------
+
+def discord(metodo, ruta, **kw):
+    for _ in range(4):
+        r = requests.request(metodo, API + ruta, headers=HEAD, timeout=30, **kw)
+        if r.status_code == 429:
+            time.sleep(float(r.json().get("retry_after", 1)) + 0.5)
+            continue
+        r.raise_for_status()
+        return r.json() if r.content else None
+    raise RuntimeError("Discord: demasiados reintentos")
+
+
+def canales_texto():
+    return [c for c in discord("GET", f"/guilds/{GUILD_ID}/channels") if c["type"] == 0]
+
+
+def enviar(canal_id, texto):
+    for trozo in trocear(texto):
+        discord("POST", f"/channels/{canal_id}/messages",
+                json={"content": trozo, "allowed_mentions": {"parse": []}})
+
+
+# ----------------------------- Memoria -----------------------------
+
+def cargar(nombre):
+    p = MEMORIA / f"{nombre}.json"
+    if p.exists():
+        return json.loads(p.read_text("utf-8"))
+    return {"proyecto": nombre, "descripcion": "", "estado": "",
+            "tareas": [], "decisiones": [], "notas": []}
+
+
+def guardar(m):
+    MEMORIA.mkdir(exist_ok=True)
+    (MEMORIA / f"{m['proyecto']}.json").write_text(
+        json.dumps(m, ensure_ascii=False, indent=2), "utf-8")
+
+
+def cargar_estado():
+    return json.loads(ESTADO.read_text("utf-8")) if ESTADO.exists() else {}
+
+
+def guardar_estado(estado):
+    ESTADO.write_text(json.dumps(estado, indent=2), "utf-8")
+
+
+def nuevo_id(lista):
+    return max([x["id"] for x in lista], default=0) + 1
+
+
+def buscar(lista, arg):
+    m = re.search(r"\d+", arg or "")
+    if not m:
+        return None
+    n = int(m.group())
+    return next((x for x in lista if x["id"] == n), None)
+
+
+def partir_fecha(arg):
+    """'texto | 2026-12-05' -> ('texto', '2026-12-05')."""
+    if " | " in arg:
+        texto, f = arg.rsplit(" | ", 1)
+        try:
+            dt.date.fromisoformat(f.strip())
+        except ValueError:
+            raise ValueError("Fecha no válida. Usa AAAA-MM-DD, por ejemplo: "
+                             "`!tarea Preparar demo | 2026-12-05`")
+        return texto.strip(), f.strip()
+    return arg.strip(), None
+
+
+def formato_tarea(t):
+    marca = "✅" if t["hecha"] else "⬜"
+    fecha = f" 📅 {t['fecha']}" if t.get("fecha") else ""
+    return f"`#{t['id']}` {marca} {t['texto']}{fecha}"
+
+
+def formato_item(x):
+    return f"`#{x['id']}` {x['texto']} _({x['fecha']})_"
+
+
+def ordenar_por_fecha(tareas):
+    return sorted(tareas, key=lambda t: (t.get("fecha") or "9999-99-99", t["id"]))
+
+
+def plan_semana(m, hoy):
+    pend = [t for t in m["tareas"] if not t["hecha"]]
+    limite = hoy + dt.timedelta(days=7)
+
+    def f(t):
+        return dt.date.fromisoformat(t["fecha"])
+
+    venc = ordenar_por_fecha([t for t in pend if t.get("fecha") and f(t) < hoy])
+    prox = ordenar_por_fecha([t for t in pend if t.get("fecha") and hoy <= f(t) <= limite])
+    sin = [t for t in pend if not t.get("fecha")]
+    return venc, prox, sin
+
+
+def lineas_plan(venc, prox, sin):
+    out = []
+    if venc:
+        out += ["⚠️ **Vencidas**"] + [formato_tarea(t) for t in venc]
+    if prox:
+        out += ["📅 **Próximos 7 días**"] + [formato_tarea(t) for t in prox]
+    if sin:
+        out += ["📝 **Sin fecha**"] + [formato_tarea(t) for t in sin]
+    return out
+
+
+# ----------------------------- Comandos -----------------------------
+
+def comando(m, nombre, cmd, arg):
+    """Devuelve (respuesta, memoria_modificada)."""
+    hoy = hoy_local()
+
+    if cmd in ("ayuda", "help"):
+        return AYUDA, False
+
+    if cmd in ("tarea", "recordar"):
+        if not arg:
+            return "Escribe la tarea. Ejemplo: `!tarea Preparar demo | 2026-12-05`", False
+        try:
+            texto, fecha = partir_fecha(arg)
+        except ValueError as e:
+            return str(e), False
+        t = {"id": nuevo_id(m["tareas"]), "texto": texto, "hecha": False,
+             "creada": hoy.isoformat(), "fecha": fecha}
+        m["tareas"].append(t)
+        return f"Tarea añadida a **{nombre}**: {formato_tarea(t)}", True
+
+    if cmd in ("hecha", "hecho"):
+        t = buscar(m["tareas"], arg)
+        if not t:
+            return "No encuentro esa tarea. Mira los números con `!tareas`.", False
+        t["hecha"] = True
+        return f"Hecha: {formato_tarea(t)}", True
+
+    if cmd in ("pendientes", "pendiente"):
+        pend = ordenar_por_fecha([t for t in m["tareas"] if not t["hecha"]])
+        if not pend:
+            return f"No hay tareas pendientes en **{nombre}**. 🎉", False
+        return f"**Pendientes de {nombre}**\n" + "\n".join(formato_tarea(t) for t in pend), False
+
+    if cmd == "tareas":
+        if not m["tareas"]:
+            return "Todavía no hay tareas en este proyecto.", False
+        return f"**Tareas de {nombre}**\n" + "\n".join(
+            formato_tarea(t) for t in ordenar_por_fecha(m["tareas"])), False
+
+    if cmd == "semana":
+        venc, prox, sin = plan_semana(m, hoy)
+        lineas = lineas_plan(venc, prox, sin)
+        if not lineas:
+            return f"Nada pendiente en **{nombre}**.", False
+        return f"**Plan de la semana · {nombre}**\n" + "\n".join(lineas), False
+
+    if cmd in ("decision", "nota"):
+        if not arg:
+            return f"Escribe el texto. Ejemplo: `!{cmd} lo que quieras guardar`", False
+        lista = m["decisiones" if cmd == "decision" else "notas"]
+        x = {"id": nuevo_id(lista), "texto": arg, "fecha": hoy.isoformat()}
+        lista.append(x)
+        etiqueta = "Decisión" if cmd == "decision" else "Nota"
+        return f"{etiqueta} guardada: {formato_item(x)}", True
+
+    if cmd in ("decisiones", "notas"):
+        lista = m[cmd]
+        if not lista:
+            return f"No hay {cmd} guardadas en este proyecto.", False
+        return f"**{cmd.capitalize()} de {nombre}**\n" + "\n".join(formato_item(x) for x in lista), False
+
+    if cmd in ("estado", "descripcion"):
+        if arg:
+            m[cmd] = arg
+            return f"Actualizado ({cmd}): {arg}", True
+        return f"**{cmd.capitalize()}:** {m[cmd] or '(vacío)'}", False
+
+    if cmd == "resumen":
+        pend = [t for t in m["tareas"] if not t["hecha"]]
+        venc, prox, sin = plan_semana(m, hoy)
+        cab = [f"**{nombre}**",
+               f"Descripción: {m['descripcion'] or '(vacía)'}",
+               f"Estado: {m['estado'] or '(sin definir)'}",
+               f"Pendientes: {len(pend)} · Decisiones: {len(m['decisiones'])} · Notas: {len(m['notas'])}"]
+        return "\n".join(cab + lineas_plan(venc, prox, sin)), False
+
+    if cmd == "proyectos":
+        archivos = sorted(MEMORIA.glob("*.json"))
+        if not archivos:
+            return "Todavía no hay proyectos con datos guardados.", False
+        filas = []
+        for p in archivos:
+            d = json.loads(p.read_text("utf-8"))
+            n = len([t for t in d["tareas"] if not t["hecha"]])
+            filas.append(f"• **{d['proyecto']}** · {n} pendientes · {d['estado'] or 'sin estado'}")
+        return "**Proyectos**\n" + "\n".join(filas), False
+
+    if cmd == "borrar":
+        partes = arg.split(maxsplit=1)
+        tipos = {"tarea": "tareas", "decision": "decisiones", "nota": "notas"}
+        if len(partes) != 2 or partes[0].lower() not in tipos:
+            return "Uso: `!borrar tarea|decision|nota N`", False
+        lista = m[tipos[partes[0].lower()]]
+        x = buscar(lista, partes[1])
+        if not x:
+            return "No encuentro ese elemento.", False
+        lista.remove(x)
+        return f"Eliminado: {x['texto']}", True
+
+    if cmd == "borrarproyecto":
+        if arg.lower() != "confirmar":
+            return (f"Esto borra TODA la memoria de **{nombre}**. "
+                    "Si estás seguro, escribe `!borrarproyecto confirmar`."), False
+        p = MEMORIA / f"{nombre}.json"
+        if p.exists():
+            p.unlink()
+        return f"Memoria de **{nombre}** eliminada.", False
+
+    return "No conozco ese comando. Escribe `!ayuda`.", False
+
+
+# ----------------------------- IA opcional -----------------------------
+
+def ia_configurada():
+    return bool(IA_PROVEEDOR and IA_MODELO and IA_CLAVE)
+
+
+def preguntar_ia(sistema, mensaje):
+    if IA_PROVEEDOR == "anthropic":
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": IA_CLAVE, "anthropic-version": "2023-06-01",
+                     "content-type": "application/json"},
+            json={"model": IA_MODELO, "max_tokens": 1000, "system": sistema,
+                  "messages": [{"role": "user", "content": mensaje}]},
+            timeout=90)
+        r.raise_for_status()
+        return "".join(b.get("text", "") for b in r.json()["content"])
+
+    if IA_PROVEEDOR == "gemini":
+        r = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{IA_MODELO}:generateContent",
+            headers={"x-goog-api-key": IA_CLAVE},
+            json={"systemInstruction": {"parts": [{"text": sistema}]},
+                  "contents": [{"role": "user", "parts": [{"text": mensaje}]}]},
+            timeout=90)
+        r.raise_for_status()
+        partes = r.json()["candidates"][0]["content"]["parts"]
+        return "".join(p.get("text", "") for p in partes)
+
+    if IA_PROVEEDOR == "openai":  # también vale para servicios compatibles (IA_URL)
+        base = IA_URL or "https://api.openai.com/v1"
+        r = requests.post(
+            f"{base}/chat/completions",
+            headers={"Authorization": f"Bearer {IA_CLAVE}"},
+            json={"model": IA_MODELO,
+                  "messages": [{"role": "system", "content": sistema},
+                               {"role": "user", "content": mensaje}]},
+            timeout=90)
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"]
+
+    raise ValueError(f"Proveedor de IA desconocido: {IA_PROVEEDOR}")
+
+
+def responder_con_ia(m, nombre, texto):
+    sistema = (
+        "Eres CARTER, el asistente personal privado de tu usuario. Responde siempre en español, "
+        "de forma clara y concisa. Estás en el canal del proyecto "
+        f"'{nombre}'. Esta es la memoria actual del proyecto (JSON):\n"
+        f"{json.dumps(m, ensure_ascii=False)[:6000]}\n"
+        "No inventes datos que no estén en la memoria. No puedes modificar la memoria: si el "
+        "usuario quiere guardar algo, indícale el comando (`!tarea`, `!decision`, `!nota`, `!estado`)."
+    )
+    try:
+        return preguntar_ia(sistema, texto)[:6000] or "(La IA no devolvió texto.)"
+    except Exception as e:  # no se imprime la clave ni la petición
+        print(f"Error de IA: {type(e).__name__}", file=sys.stderr)
+        return "No pude consultar la IA. Revisa la clave y el modelo en los Secrets del repositorio."
+
+
+# ----------------------------- Flujo principal -----------------------------
+
+def responder(canal, nombre, texto):
+    m = cargar(nombre)
+    if texto.startswith("!"):
+        partes = texto[1:].split(maxsplit=1)
+        cmd = partes[0].lower() if partes else ""
+        arg = partes[1].strip() if len(partes) > 1 else ""
+        resp, cambio = comando(m, nombre, cmd, arg)
+        if cambio:
+            guardar(m)
+    elif ia_configurada():
+        resp = responder_con_ia(m, nombre, texto)
+    else:
+        resp = "La IA aún no está conectada. Escribe `!ayuda` para ver los comandos."
+    enviar(canal["id"], resp)
+
+
+def sondeo():
+    estado = cargar_estado()
+    for c in canales_texto():
+        cid, nombre = c["id"], limpiar(c["name"])
+        if cid not in estado:
+            # Primera vez que vemos el canal: marcamos el último mensaje y no
+            # respondemos al historial anterior.
+            ultimos = discord("GET", f"/channels/{cid}/messages", params={"limit": 1})
+            estado[cid] = ultimos[0]["id"] if ultimos else "0"
+            guardar_estado(estado)
+            continue
+        msgs = discord("GET", f"/channels/{cid}/messages",
+                       params={"after": estado[cid], "limit": 50})
+        msgs.sort(key=lambda x: int(x["id"]))
+        for msg in msgs:
+            estado[cid] = msg["id"]
+            guardar_estado(estado)
+            autor = msg["author"]
+            if autor.get("bot") or autor["id"] != USUARIO:
+                continue  # solo obedece a tu usuario
+            texto = msg["content"].strip()
+            if texto:
+                responder(c, nombre, texto)
+
+
+def resumen_diario():
+    hoy = hoy_local()
+    canales = {limpiar(c["name"]): c for c in canales_texto()}
+    destino = canales.get(limpiar(CANAL_RESUMEN))
+    if not destino:
+        sys.exit(f"No encuentro el canal '{CANAL_RESUMEN}' para publicar el resumen.")
+    bloques = []
+    for p in sorted(MEMORIA.glob("*.json")):
+        m = json.loads(p.read_text("utf-8"))
+        lineas = lineas_plan(*plan_semana(m, hoy))
+        if lineas:
+            bloques.append("\n".join([f"**{m['proyecto']}**"] + lineas))
+    if bloques:
+        texto = f"☀️ **Buenos días. Resumen del {hoy.isoformat()}**\n\n" + "\n\n".join(bloques)
+    else:
+        texto = f"☀️ **Buenos días ({hoy.isoformat()}).** No tienes tareas pendientes. 🎉"
+    enviar(destino["id"], texto)
+
+
+def main():
+    faltan = [n for n, v in (("DISCORD_TOKEN", TOKEN), ("DISCORD_GUILD_ID", GUILD_ID),
+                             ("DISCORD_USER_ID", USUARIO)) if not v]
+    if faltan:
+        sys.exit("Faltan estos secretos en GitHub: " + ", ".join(faltan))
+    MEMORIA.mkdir(exist_ok=True)
+    if not ESTADO.exists():
+        ESTADO.write_text("{}", "utf-8")
+    modo = sys.argv[1] if len(sys.argv) > 1 else "sondeo"
+    if modo == "sondeo":
+        sondeo()
+    elif modo == "resumen":
+        resumen_diario()
+    else:
+        sys.exit("Modo desconocido. Usa: sondeo | resumen")
+
+
+if __name__ == "__main__":
+    main()
